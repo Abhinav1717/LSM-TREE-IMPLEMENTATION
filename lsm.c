@@ -1,3 +1,6 @@
+
+/* CS631 start */
+
 #include "postgres.h"
 #include "access/attnum.h"
 #include "utils/relcache.h"
@@ -34,8 +37,69 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
-
 #include "lsm.h"
+
+#include "access/amapi.h"
+#include "access/heapam.h"
+#include "access/multixact.h"
+#include "access/reloptions.h"
+#include "access/relscan.h"
+#include "access/sysattr.h"
+#include "access/tableam.h"
+#include "access/toast_compression.h"
+#include "access/transam.h"
+#include "access/visibilitymap.h"
+#include "access/xact.h"
+#include "bootstrap/bootstrap.h"
+#include "catalog/binary_upgrade.h"
+#include "catalog/catalog.h"
+#include "catalog/dependency.h"
+#include "catalog/heap.h"
+#include "catalog/index.h"
+#include "catalog/objectaccess.h"
+#include "catalog/partition.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_description.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_opclass.h"
+#include "catalog/pg_operator.h"
+#include "catalog/pg_tablespace.h"
+#include "catalog/pg_trigger.h"
+#include "catalog/pg_type.h"
+#include "catalog/storage.h"
+#include "commands/event_trigger.h"
+#include "commands/progress.h"
+#include "commands/tablecmds.h"
+#include "commands/tablespace.h"
+#include "commands/trigger.h"
+#include "executor/executor.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "parser/parser.h"
+#include "pgstat.h"
+#include "rewrite/rewriteManip.h"
+#include "storage/bufmgr.h"
+#include "storage/lmgr.h"
+#include "storage/predicate.h"
+#include "storage/procarray.h"
+#include "storage/smgr.h"
+#include "utils/builtins.h"
+#include "utils/datum.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
+#include "utils/inval.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/pg_rusage.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/syscache.h"
+#include "utils/tuplesort.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -129,6 +193,8 @@ lsm_merge_indexes(Oid dst_oid, Relation top_index, Oid heap_oid)
 
 	elog(NOTICE, "lsm: merge index %s with size %d blocks", RelationGetRelationName(top_index), RelationGetNumberOfBlocks(top_index));
 
+
+	//Currently copying the index tuples one by one, should have used bottom up build construction for better node occupancy
 	base_index->rd_rel->relam = BTREE_AM_OID;
 	scan = index_beginscan(heap, top_index, SnapshotAny, 0, 0);
 	scan->xs_want_itup = true;
@@ -138,6 +204,8 @@ lsm_merge_indexes(Oid dst_oid, Relation top_index, Oid heap_oid)
 
 		IndexUniqueCheck checkUnique = UNIQUE_CHECK_NO;
 		IndexTuple itup = scan->xs_itup;
+		
+		//Not being used in our case
 		if (BTreeTupleIsPosting(itup))
 		{
 			/* 
@@ -298,7 +366,6 @@ lsm_create_l1_tree_if_not_exits(Relation heap,Relation index,LsmMetaData* lsmMet
 			newName[i+4]=l0name[i];
 		}
 		elog(NOTICE,"lsm_create_l1_tree_if_not_exits: L1 index name = %s ",newName);
-
 		lsmMetaCopy->l1[lsmMetaCopy->current_l1_tree]= index_concurrently_create_copy(
 		   		 heap,/*heap relation*/
 		   		 index->rd_id,/*old oid*/
@@ -306,17 +373,25 @@ lsm_create_l1_tree_if_not_exits(Relation heap,Relation index,LsmMetaData* lsmMet
 		   		 newName/*new name =l1+oldname*/
 		   	 ); // Not workinng
 		// opening index not table issue
-
-		index_set_state_flags(lsmMetaCopy->l1[lsmMetaCopy->current_l1_tree],INDEX_CREATE_SET_VALID);
 		l1=index_open(lsmMetaCopy->l1[lsmMetaCopy->current_l1_tree],AccessShareLock);
+
+
 //		index_build(heap,l1,BuildIndexInfo(l1),false,false);
 		lsm_not_l0_build(heap,l1,BuildIndexInfo(l1));
+		Relation pg_index = table_open(IndexRelationId,RowExclusiveLock);
+		HeapTuple indexTuple = SearchSysCacheCopy1(INDEXRELID,ObjectIdGetDatum(lsmMetaCopy->l1[lsmMetaCopy->current_l1_tree]));
 
+//		l1->rd_index->indisvalid=true;
+//		Form_pg_index indexForm= l1->rd_index;
+		Form_pg_index indexForm = (Form_pg_index)GETSTRUCT(indexTuple);
+		indexForm->indisvalid = true;
+
+		CatalogTupleUpdate(pg_index,&indexTuple->t_self,indexTuple);
+
+		table_close(pg_index,RowExclusiveLock);
+
+//		index_set_state_flags(l1->rd_index->indexrelid, INDEX_CREATE_SET_VALID);
 		index_close(l1,AccessShareLock);
-
-		index_set_state_flags(lsmMetaCopy->l1[lsmMetaCopy->current_l1_tree],INDEX_CREATE_SET_VALID);
-
-
 	}
 }
 void
@@ -350,9 +425,21 @@ lsm_create_l2_if_not_exits(Relation heap,Relation index,LsmMetaData* lsmMetaCopy
 			newName/*new name =l1+oldname*/
 		);
 
-
 		l2=index_open(lsmMetaCopy->l2,AccessShareLock);
 		lsm_not_l0_build(heap,l2,BuildIndexInfo(l2));
+//		l2->rd_index->indisvalid=true;
+		Relation pg_index = table_open(IndexRelationId,RowExclusiveLock);
+		HeapTuple indexTuple = SearchSysCacheCopy1(INDEXRELID,ObjectIdGetDatum(lsmMetaCopy->l2));
+
+//		l1->rd_index->indisvalid=true;
+//		Form_pg_index indexForm= l1->rd_index;
+		Form_pg_index indexForm = (Form_pg_index)GETSTRUCT(indexTuple);
+		indexForm->indisvalid = true;
+
+		CatalogTupleUpdate(pg_index,&indexTuple->t_self,indexTuple);
+
+		table_close(pg_index,RowExclusiveLock);
+		//index_set_state_flags(l2->rd_index->indexrelid, INDEX_CREATE_SET_VALID);
 		index_close(l2,AccessShareLock);
 	}
 }
@@ -466,7 +553,10 @@ lsm_insert(Relation rel, Datum *values, bool *isnull,
 			pfree(lsmMetaCopy);
 
 		}
-
+		
+		//Also Currently the lsm meta data is being stored with the btree meta data of the top level, but could have stored lsm meta data seperately to avoid initializing it 		 	again and again 
+		
+		//Instead of copying entire tree we could have just changed to Oid of the l1 level and instantiated the l0 level again.
 		lsmMetaCopy=(LsmMetaData*)palloc(sizeof(LsmMetaData));
 		elog(NOTICE,"palloc success");
 		memcpy(lsmMetaCopy,lsmMeta,sizeof(LsmMetaData));
@@ -542,6 +632,9 @@ lsm_insert(Relation rel, Datum *values, bool *isnull,
 }
 
 
+
+//Scanning not implemented
+
 Datum lsm_handler(PG_FUNCTION_ARGS)
 {
 //	elog(NOTICE,"LSM HANDLER FUCNCTION CALL");
@@ -593,3 +686,5 @@ Datum lsm_handler(PG_FUNCTION_ARGS)
 
 	PG_RETURN_POINTER(amroutine);
 }
+
+/* CS631 end */

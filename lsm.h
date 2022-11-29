@@ -1,3 +1,4 @@
+/* CS631 start */
 #include "access/nbtree.h"
 #define MAX_TREES_PER_LEVEL 2
 typedef struct
@@ -41,3 +42,4 @@ static bool lsm_insert(Relation rel, Datum *values, bool *isnull,
 	((LsmMetaData *)(((BTMetaPageData *) PageGetContents(p))+1))
 
 
+/* CS631 end */
